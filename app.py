@@ -25,7 +25,15 @@ from core.detector import (
     OllamaDetector,
 )
 from core.detection import detect_entities
-from core.document_lookup import AmbiguousDocumentError, resolve_document_id
+from core.document_lookup import (
+    SOURCE_EXPLICIT,
+    AmbiguousDocumentError,
+    DocumentIdConflictError,
+    DocumentIdNotFoundError,
+    InvalidDocumentIdError,
+    describe_conflict,
+    resolve_document_id,
+)
 from core.heuristics import require_no_obvious_entities
 from core.office import (
     OfficeAnonymizationError,
@@ -35,12 +43,20 @@ from core.office import (
     restore_docx_file,
     write_document_id,
 )
-from core.restore import RestoreError, restore_text
+from core.restore import RestoreError, UnknownPlaceholdersError, restore_text
 
 
 DetectorFactory = Callable[[argparse.Namespace], object]
 
 SAFE_SUFFIX_RE = re.compile(r"_SAFE(?:_[0-9A-Fa-f]{8})?")
+SUPPORTED_SUFFIXES = {".txt", ".docx"}
+UNSUPPORTED_MESSAGE = "Only TXT and DOCX files are supported.\n"
+SOURCE_LABELS = {
+    "explicit": "number given by the user",
+    "properties": "number stored inside the DOCX",
+    "filename": "number in the file name",
+    "properties+filename": "number inside the DOCX and in the file name",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -114,6 +130,10 @@ def _scan(
     stdout: TextIO,
     stderr: TextIO,
 ) -> int:
+    if not _is_supported(args.input):
+        stderr.write(UNSUPPORTED_MESSAGE)
+        return 1
+
     try:
         text = _read_input_text(args.input)
         detector = detector_factory(args)
@@ -136,6 +156,10 @@ def _anonymize(
     stdout: TextIO,
     stderr: TextIO,
 ) -> int:
+    if not _is_supported(args.input):
+        stderr.write(UNSUPPORTED_MESSAGE)
+        return 1
+
     document_id = new_document_id()
     safe_path = _safe_output_path(args.input, document_id, args.output_dir)
 
@@ -168,32 +192,66 @@ def _anonymize(
 
 
 def _restore(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
+    if not _is_supported(args.input):
+        stderr.write(UNSUPPORTED_MESSAGE)
+        return 1
+
     final_path = _final_output_path(args.input)
 
     try:
         init_db(args.db)
-        document_id = resolve_document_id(
+        resolution = resolve_document_id(
             args.input,
             _read_input_text(args.input),
             args.db,
             explicit_id=args.document_id,
         )
+        document_id = resolution.id
         mapping = load_mapping(document_id, args.db)
         if args.input.suffix.lower() == ".docx":
             result = restore_docx_file(args.input, final_path, mapping)
-        elif is_supported_office_file(args.input):
-            raise OfficeAnonymizationError("Office restore currently supports DOCX only")
         else:
             text = _read_text_file(args.input)
             result = restore_text(text, mapping)
             final_path.write_text(result.text, encoding="utf-8")
+    except UnknownPlaceholdersError as exc:
+        stderr.write(
+            f"The file does not belong to document {exc.document_id}: "
+            f"it has placeholders this document does not have ({', '.join(exc.unknown)}).\n"
+            "FINAL file was not created. Check the document number.\n"
+        )
+        return 1
     except RestoreError as exc:
         stderr.write(f"{exc}\n")
         return 1
+    except InvalidDocumentIdError:
+        stderr.write("Invalid document number. It has 8 characters 0-9 and A-F, e.g. 39F3C1EE.\n")
+        return 1
+    except DocumentIdNotFoundError as exc:
+        stderr.write(f"Document {exc.document_id} was not found in the database ({SOURCE_LABELS[exc.source]}).\n")
+        if exc.source == SOURCE_EXPLICIT:
+            stderr.write("No other document is chosen automatically.\n")
+        else:
+            stderr.write("If the file belongs to another document, run restore again with its number.\n")
+        return 1
+    except DocumentIdConflictError as exc:
+        stderr.write(
+            "Document number mismatch: the file name and the DOCX properties point to different documents.\n"
+            "Run restore again with the correct number:\n"
+        )
+        for source, number, info in describe_conflict(exc):
+            details = f"{info.source_name}  {info.created_at}" if info else "not in the database"
+            stderr.write(f"  {number}  ({SOURCE_LABELS[source]})  {details}\n")
+        return 1
     except AmbiguousDocumentError as exc:
-        stderr.write("Several documents match this file. Run restore again with one of the numbers:\n")
+        stderr.write(
+            "The file has no document number. Choose the source document and run restore again with its number:\n"
+        )
         for candidate in exc.candidates:
-            stderr.write(f"  {candidate.id}  {candidate.source_name}  {candidate.created_at}\n")
+            stderr.write(
+                f"  {candidate.id}  {candidate.source_name}  {candidate.created_at}  "
+                f"missing {candidate.missing_placeholders} of {candidate.total_placeholders} placeholders\n"
+            )
         return 1
     except DocumentNotFoundError:
         stderr.write("Document was not found in the database.\n")
@@ -202,12 +260,17 @@ def _restore(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
         stderr.write("Restore failed; no sensitive content was printed.\n")
         return 1
 
-    stdout.write(f"Document ID: {document_id}\n")
+    stdout.write(f"Document ID: {document_id} ({SOURCE_LABELS[resolution.source]})\n")
     stdout.write(f"FINAL document: {final_path}\n")
     stdout.write(
         "Placeholders: "
-        f"expected={result.expected_count}, found={result.found_count}, missing=0\n"
+        f"expected={result.expected_count}, found={result.found_count}, missing={len(result.missing)}\n"
     )
+    if result.missing:
+        stdout.write(
+            "Warning: these placeholders of the document are not in the file "
+            f"(probably removed while editing): {', '.join(result.missing)}\n"
+        )
     return 0
 
 
@@ -252,6 +315,10 @@ def _default_detector_factory(args: argparse.Namespace) -> OllamaDetector:
         prompt_path=args.prompt,
         timeout_seconds=args.timeout_seconds,
     )
+
+
+def _is_supported(path: Path) -> bool:
+    return path.suffix.lower() in SUPPORTED_SUFFIXES
 
 
 def _read_text_file(path: Path) -> str:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
 
 
@@ -156,6 +156,16 @@ class Mapping:
 
 def format_placeholder(key: str) -> str:
     return f"{PLACEHOLDER_PREFIX}{key}{PLACEHOLDER_SUFFIX}"
+
+
+PLACEHOLDER_KEY_RE = re.compile(
+    re.escape(PLACEHOLDER_PREFIX) + r"([A-Z0-9_]+)" + re.escape(PLACEHOLDER_SUFFIX)
+)
+
+
+def placeholder_keys_in(text: str) -> Set[str]:
+    """Keys of all placeholders in a text, e.g. {"PERSON_001", "IP_002"}."""
+    return set(PLACEHOLDER_KEY_RE.findall(text))
 
 
 def normalize_entity_type(entity_type: str) -> str:

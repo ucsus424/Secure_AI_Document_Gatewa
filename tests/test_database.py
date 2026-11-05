@@ -1,3 +1,4 @@
+from contextlib import closing
 import sqlite3
 import tempfile
 import unittest
@@ -31,7 +32,7 @@ class DatabaseTests(unittest.TestCase):
         init_db(self.db_path)
 
         self.assertTrue(self.db_path.exists())
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection:
             tables = {
                 row[0]
                 for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 from uuid import uuid4
 
 from core.models import Mapping
@@ -36,9 +37,26 @@ class DocumentNotFoundError(DatabaseError):
     """Raised when no document exists for the requested id."""
 
 
+DOCUMENT_ID_RE = re.compile(r"^[0-9A-F]{8}$")
+
+
+@dataclass(frozen=True)
+class DocumentInfo:
+    """Short description of a stored document, safe to show to the user."""
+
+    id: str
+    source_name: str
+    created_at: str
+
+
 @dataclass(frozen=True)
 class DocumentMatch:
-    """A document whose placeholders appear in an uploaded file."""
+    """A document that owns every placeholder found in an uploaded file.
+
+    The counts are only a hint for the user. A document is never chosen
+    automatically because of them: a short document always "matches better",
+    even when the file came from another, longer document.
+    """
 
     id: str
     source_name: str
@@ -47,8 +65,9 @@ class DocumentMatch:
     matched_placeholders: int
 
     @property
-    def is_complete(self) -> bool:
-        return self.total_placeholders == self.matched_placeholders
+    def missing_placeholders(self) -> int:
+        """Placeholders of the document that are absent from the file."""
+        return self.total_placeholders - self.matched_placeholders
 
 
 def new_document_id() -> str:
@@ -58,6 +77,11 @@ def new_document_id() -> str:
 
 def normalize_document_id(document_id: str) -> str:
     return document_id.strip().upper()
+
+
+def is_valid_document_id(document_id: str) -> bool:
+    """A document number is 8 hex characters, e.g. 39F3C1EE."""
+    return bool(DOCUMENT_ID_RE.match(normalize_document_id(document_id)))
 
 
 def connect(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -153,14 +177,35 @@ def document_exists(document_id: str, db_path: Path = DEFAULT_DB_PATH) -> bool:
     return row is not None
 
 
+def get_document_info(document_id: str, db_path: Path = DEFAULT_DB_PATH) -> Optional[DocumentInfo]:
+    """Name and date of a stored document, or None when it does not exist."""
+    document_id = normalize_document_id(document_id)
+    try:
+        connection = connect(db_path)
+        try:
+            row = connection.execute(
+                "SELECT id, source_name, created_at FROM documents WHERE id = ?",
+                (document_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        raise DatabaseError("document could not be read") from exc
+    if row is None:
+        return None
+    return DocumentInfo(id=row[0], source_name=row[1], created_at=str(row[2]))
+
+
 def find_documents_by_placeholders(
     placeholder_keys: Iterable[str],
     db_path: Path = DEFAULT_DB_PATH,
 ) -> List[DocumentMatch]:
     """Find documents that own every placeholder found in a file.
 
-    A document matches when all given placeholders belong to it. Documents
-    whose placeholders are all present in the file come first.
+    A document matches when all given placeholders belong to it: a file
+    placeholder that a document does not have rules that document out.
+    Documents with fewer missing placeholders are listed first, newer first
+    on ties. The order is only a hint for the user, not a decision.
     """
     keys = sorted(set(placeholder_keys))
     if not keys:
@@ -175,7 +220,7 @@ def find_documents_by_placeholders(
         JOIN entities AS e ON e.document_id = d.id
         GROUP BY d.id
         HAVING matched = ?
-        ORDER BY (COUNT(*) = matched) DESC, d.created_at DESC
+        ORDER BY (COUNT(*) - matched) ASC, d.created_at DESC
     """
     try:
         connection = connect(db_path)

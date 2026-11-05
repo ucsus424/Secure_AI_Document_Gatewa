@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import re
+from contextlib import closing
 import sqlite3
 import tempfile
 import unittest
@@ -10,11 +11,10 @@ import app
 from core.database import load_mapping
 from core.detector import DetectorError
 from core.models import Entity
+from core.office import read_document_id
 
 
 DOCX_AVAILABLE = importlib.util.find_spec("docx") is not None
-OPENPYXL_AVAILABLE = importlib.util.find_spec("openpyxl") is not None
-PPTX_AVAILABLE = importlib.util.find_spec("pptx") is not None
 
 
 class OfficeFakeDetector:
@@ -65,7 +65,7 @@ def safe_path_for(input_path, document_id):
 def count_documents(db_path):
     if not db_path.exists():
         return 0
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         return connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
 
 
@@ -102,6 +102,7 @@ class DocxAnonymizeTests(unittest.TestCase):
             self.assertIn("⟦OBJECT_001⟧", safe_text)
             self.assertIn("⟦IP_001⟧", safe_text)
 
+            self.assertEqual(read_document_id(safe_path), document_id)
             mapping = load_mapping(document_id, db_path)
             self.assertEqual(mapping.source_name, "report.docx")
             self.assertEqual(mapping.entities["PERSON_001"], "Петров А.В.")
@@ -169,68 +170,13 @@ class DocxAnonymizeTests(unittest.TestCase):
             self.assertNotIn("Qwerty-2026!", stderr)
 
 
-@unittest.skipUnless(OPENPYXL_AVAILABLE, "openpyxl is unavailable")
-class XlsxAnonymizeTests(unittest.TestCase):
-    def test_anonymize_writes_safe_xlsx_and_saves_values_to_database(self):
-        from openpyxl import Workbook, load_workbook
+class UnsupportedOfficeFormatsTests(unittest.TestCase):
+    def test_xlsx_and_pptx_are_not_supported(self):
+        from core.office import is_supported_office_file
 
-        with tempfile.TemporaryDirectory() as tmp:
-            input_path = Path(tmp) / "plan.xlsx"
-            workbook = Workbook()
-            sheet = workbook.active
-            sheet.title = "Main"
-            sheet["A1"] = "Ответственный"
-            sheet["B1"] = "Петров А.В."
-            sheet["A2"] = "Узел"
-            sheet["B2"] = "ВРН-Север-17"
-            sheet["A3"] = "IP"
-            sheet["B3"] = "10.74.16.1/24"
-            workbook.save(input_path)
-
-            code, stdout, stderr, document_id, db_path = run_anonymize(input_path, OfficeFakeDetector())
-
-            self.assertEqual(code, 0)
-            safe_path = safe_path_for(input_path, document_id)
-            self.assertTrue(safe_path.exists())
-
-            safe_workbook = load_workbook(safe_path)
-            safe_sheet = safe_workbook["Main"]
-            values = [safe_sheet["B1"].value, safe_sheet["B2"].value, safe_sheet["B3"].value]
-            self.assertEqual(values, ["⟦PERSON_001⟧", "⟦OBJECT_001⟧", "⟦IP_001⟧"])
-            self.assertEqual(load_mapping(document_id, db_path).entities["OBJECT_001"], "ВРН-Север-17")
-            self.assertEqual(stderr, "")
-
-
-@unittest.skipUnless(PPTX_AVAILABLE, "python-pptx is unavailable")
-class PptxAnonymizeTests(unittest.TestCase):
-    def test_anonymize_writes_safe_pptx_and_saves_values_to_database(self):
-        from pptx import Presentation
-
-        with tempfile.TemporaryDirectory() as tmp:
-            input_path = Path(tmp) / "deck.pptx"
-            presentation = Presentation()
-            slide = presentation.slides.add_slide(presentation.slide_layouts[5])
-            slide.shapes.title.text = "Объект ВРН-Север-17"
-            text_box = slide.shapes.add_textbox(914400, 1371600, 7315200, 914400)
-            text_box.text = "Инженер Петров А.В. настроил 10.74.16.1/24"
-            presentation.save(input_path)
-
-            code, stdout, stderr, document_id, db_path = run_anonymize(input_path, OfficeFakeDetector())
-
-            self.assertEqual(code, 0)
-            safe_path = safe_path_for(input_path, document_id)
-            self.assertTrue(safe_path.exists())
-
-            safe_presentation = Presentation(safe_path)
-            safe_text = "\n".join(_pptx_text(safe_presentation))
-            self.assertNotIn("Петров А.В.", safe_text)
-            self.assertNotIn("ВРН-Север-17", safe_text)
-            self.assertNotIn("10.74.16.1/24", safe_text)
-            self.assertIn("⟦PERSON_001⟧", safe_text)
-            self.assertIn("⟦OBJECT_001⟧", safe_text)
-            self.assertIn("⟦IP_001⟧", safe_text)
-            self.assertEqual(load_mapping(document_id, db_path).entities["PERSON_001"], "Петров А.В.")
-            self.assertEqual(stderr, "")
+        self.assertTrue(is_supported_office_file(Path("report.docx")))
+        self.assertFalse(is_supported_office_file(Path("plan.xlsx")))
+        self.assertFalse(is_supported_office_file(Path("deck.pptx")))
 
 
 def _docx_text(document):
@@ -240,13 +186,6 @@ def _docx_text(document):
         for row in table.rows:
             for cell in row.cells:
                 yield cell.text
-
-
-def _pptx_text(presentation):
-    for slide in presentation.slides:
-        for shape in slide.shapes:
-            if hasattr(shape, "text"):
-                yield shape.text
 
 
 if __name__ == "__main__":

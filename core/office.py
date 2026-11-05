@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-from xml.etree import ElementTree
+from lxml import etree
 from zipfile import BadZipFile, ZipFile
 
 from core.models import Mapping, format_placeholder
@@ -11,13 +11,37 @@ from core.restore import RestoreResult, restore_text
 
 
 class OfficeAnonymizationError(RuntimeError):
-    """Raised when an Office file cannot be anonymized safely."""
+    """Raised when a DOCX file cannot be anonymized safely."""
 
 
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
-SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 XML_SPACE_ATTR = "{http://www.w3.org/XML/1998/namespace}space"
+
+# lxml сохраняет XML Word как есть: префиксы (w:, mc:, w14:), все объявления
+# пространств имён и standalone="yes". Стандартный ElementTree их терял,
+# из-за чего Word сообщал об ошибке в содержимом SAFE/FINAL-файлов.
+XML_PARSER = etree.XMLParser(
+    resolve_entities=False,
+    no_network=True,
+    remove_blank_text=False,
+    huge_tree=True,
+)
+XML_ERRORS = (etree.XMLSyntaxError, ValueError)
+
+
+def _parse_xml(data: bytes) -> etree._Element:
+    return etree.fromstring(data, parser=XML_PARSER)
+
+
+def _serialize_xml(root: etree._Element) -> bytes:
+    tree = root.getroottree()
+    return etree.tostring(
+        tree,
+        xml_declaration=True,
+        encoding="UTF-8",
+        standalone=tree.docinfo.standalone,
+    )
 
 
 @dataclass(frozen=True)
@@ -34,18 +58,6 @@ OFFICE_FORMATS = {
         part_prefixes=("word/",),
         group_tags=((WORD_NS, "p"), (DRAWING_NS, "p")),
         text_tags=((WORD_NS, "t"), (DRAWING_NS, "t")),
-    ),
-    ".xlsx": OfficeFormat(
-        suffix=".xlsx",
-        part_prefixes=("xl/",),
-        group_tags=((SPREADSHEET_NS, "si"), (SPREADSHEET_NS, "is"), (DRAWING_NS, "p")),
-        text_tags=((SPREADSHEET_NS, "t"), (DRAWING_NS, "t")),
-    ),
-    ".pptx": OfficeFormat(
-        suffix=".pptx",
-        part_prefixes=("ppt/",),
-        group_tags=((DRAWING_NS, "p"),),
-        text_tags=((DRAWING_NS, "t"),),
     ),
 }
 
@@ -65,7 +77,7 @@ def extract_office_text(path: Path) -> str:
                     continue
                 data = archive.read(name)
                 text_blocks.extend(_extract_xml_text(data, office_format))
-    except (BadZipFile, OSError, ElementTree.ParseError) as exc:
+    except (BadZipFile, OSError, *XML_ERRORS) as exc:
         raise OfficeAnonymizationError("Office file text could not be extracted") from exc
 
     return "\n".join(block for block in text_blocks if block)
@@ -86,7 +98,7 @@ def anonymize_office_file(input_path: Path, output_path: Path, mapping: Mapping)
 
         _validate_no_residual_values(temporary_path, mapping)
         temporary_path.replace(output_path)
-    except (BadZipFile, OSError, ElementTree.ParseError) as exc:
+    except (BadZipFile, OSError, *XML_ERRORS) as exc:
         _remove_if_exists(temporary_path)
         raise OfficeAnonymizationError("Office file could not be anonymized") from exc
     except OfficeAnonymizationError:
@@ -114,7 +126,7 @@ def restore_docx_file(input_path: Path, output_path: Path, mapping: Mapping) -> 
 
         _validate_no_residual_placeholders(temporary_path, mapping)
         temporary_path.replace(output_path)
-    except (BadZipFile, OSError, ElementTree.ParseError) as exc:
+    except (BadZipFile, OSError, *XML_ERRORS) as exc:
         _remove_if_exists(temporary_path)
         raise OfficeAnonymizationError("DOCX file could not be restored") from exc
     except OfficeAnonymizationError:
@@ -136,7 +148,7 @@ def _should_process_part(name: str, office_format: OfficeFormat) -> bool:
 
 
 def _extract_xml_text(data: bytes, office_format: OfficeFormat) -> List[str]:
-    root = ElementTree.fromstring(data)
+    root = _parse_xml(data)
     blocks: List[str] = []
     for group in _iter_matching(root, office_format.group_tags):
         text = "".join(node.text or "" for node in _text_nodes(group, office_format))
@@ -150,7 +162,7 @@ def _replace_xml_text(
     office_format: OfficeFormat,
     replacements: Sequence[Tuple[str, str]],
 ) -> bytes:
-    root = ElementTree.fromstring(data)
+    root = _parse_xml(data)
     changed = False
 
     for group in _iter_matching(root, office_format.group_tags):
@@ -163,19 +175,21 @@ def _replace_xml_text(
     if not changed:
         return data
 
-    return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+    return _serialize_xml(root)
 
 
-def _text_nodes(root: ElementTree.Element, office_format: OfficeFormat) -> List[ElementTree.Element]:
+def _text_nodes(root: etree._Element, office_format: OfficeFormat) -> List[etree._Element]:
     return list(_iter_matching(root, office_format.text_tags))
 
 
 def _iter_matching(
-    root: ElementTree.Element,
+    root: etree._Element,
     tags: Iterable[Tuple[str, str]],
-) -> Iterable[ElementTree.Element]:
+) -> Iterable[etree._Element]:
     wanted = set(tags)
     for element in root.iter():
+        if not isinstance(element.tag, str):
+            continue  # комментарии и служебные инструкции XML
         if _split_tag(element.tag) in wanted:
             yield element
 
@@ -208,7 +222,7 @@ def _restore_replacements(mapping: Mapping) -> List[Tuple[str, str]]:
 
 
 def _replace_text_nodes(
-    nodes: Sequence[ElementTree.Element],
+    nodes: Sequence[etree._Element],
     replacements: Sequence[Tuple[str, str]],
 ) -> bool:
     changed = False
@@ -238,7 +252,7 @@ def _replacement_starts(text: str, original: str) -> List[int]:
 
 
 def _replace_node_range(
-    nodes: Sequence[ElementTree.Element],
+    nodes: Sequence[etree._Element],
     start: int,
     end: int,
     replacement: str,
@@ -264,7 +278,7 @@ def _replace_node_range(
 
 
 def _locate_character(
-    nodes: Sequence[ElementTree.Element],
+    nodes: Sequence[etree._Element],
     character_index: int,
 ) -> Tuple[int, int]:
     offset = 0
@@ -276,7 +290,7 @@ def _locate_character(
     raise OfficeAnonymizationError("replacement range is outside the Office text group")
 
 
-def _set_node_text(node: ElementTree.Element, value: str) -> None:
+def _set_node_text(node: etree._Element, value: str) -> None:
     node.text = value
     if value and (value[0].isspace() or value[-1].isspace()):
         node.set(XML_SPACE_ATTR, "preserve")
@@ -356,7 +370,7 @@ def write_document_id(path: Path, document_id: str) -> None:
                     output_archive.writestr(info, data)
                 output_archive.writestr(CUSTOM_PROPS_PART, custom_xml)
         temporary_path.replace(path)
-    except (BadZipFile, OSError, ElementTree.ParseError) as exc:
+    except (BadZipFile, OSError, *XML_ERRORS) as exc:
         _remove_if_exists(temporary_path)
         raise OfficeAnonymizationError("document id could not be written") from exc
 
@@ -369,8 +383,8 @@ def read_document_id(path: Path) -> Optional[str]:
         with ZipFile(path) as archive:
             if CUSTOM_PROPS_PART not in archive.namelist():
                 return None
-            root = ElementTree.fromstring(archive.read(CUSTOM_PROPS_PART))
-    except (BadZipFile, OSError, ElementTree.ParseError):
+            root = _parse_xml(archive.read(CUSTOM_PROPS_PART))
+    except (BadZipFile, OSError, *XML_ERRORS):
         return None
 
     for prop in root.findall(f"{{{CUSTOM_PROPS_NS}}}property"):
@@ -382,12 +396,13 @@ def read_document_id(path: Path) -> Optional[str]:
 
 
 def _custom_props_xml(existing: Optional[bytes], document_id: str) -> bytes:
-    ElementTree.register_namespace("", CUSTOM_PROPS_NS)
-    ElementTree.register_namespace("vt", VT_NS)
     if existing:
-        root = ElementTree.fromstring(existing)
+        root = _parse_xml(existing)
     else:
-        root = ElementTree.Element(f"{{{CUSTOM_PROPS_NS}}}Properties")
+        root = etree.Element(
+            f"{{{CUSTOM_PROPS_NS}}}Properties",
+            nsmap={None: CUSTOM_PROPS_NS, "vt": VT_NS},
+        )
 
     for prop in list(root.findall(f"{{{CUSTOM_PROPS_NS}}}property")):
         if prop.get("name") == DOCUMENT_ID_PROPERTY:
@@ -398,7 +413,7 @@ def _custom_props_xml(existing: Optional[bytes], document_id: str) -> bytes:
         for prop in root.findall(f"{{{CUSTOM_PROPS_NS}}}property")
         if (prop.get("pid") or "").isdigit()
     ]
-    prop = ElementTree.SubElement(
+    prop = etree.SubElement(
         root,
         f"{{{CUSTOM_PROPS_NS}}}property",
         {
@@ -407,8 +422,8 @@ def _custom_props_xml(existing: Optional[bytes], document_id: str) -> bytes:
             "name": DOCUMENT_ID_PROPERTY,
         },
     )
-    ElementTree.SubElement(prop, f"{{{VT_NS}}}lpwstr").text = document_id
-    return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+    etree.SubElement(prop, f"{{{VT_NS}}}lpwstr").text = document_id
+    return _serialize_xml(root)
 
 
 def _ensure_custom_props_content_type(data: bytes) -> bytes:

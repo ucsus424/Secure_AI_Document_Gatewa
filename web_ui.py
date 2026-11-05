@@ -23,7 +23,15 @@ from core.database import (
     save_document,
 )
 from core.detection import detect_entities
-from core.document_lookup import AmbiguousDocumentError, resolve_document_id
+from core.document_lookup import (
+    SOURCE_EXPLICIT,
+    AmbiguousDocumentError,
+    DocumentIdConflictError,
+    DocumentIdNotFoundError,
+    InvalidDocumentIdError,
+    describe_conflict,
+    resolve_document_id,
+)
 from core.detector import DetectorError, OllamaDetector
 from core.heuristics import require_no_obvious_entities
 from core.office import (
@@ -34,23 +42,31 @@ from core.office import (
     restore_docx_file,
     write_document_id,
 )
-from core.restore import RestoreError, restore_text
+from core.restore import RestoreError, UnknownPlaceholdersError, restore_text
 
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
-ANONYMIZE_SUFFIXES = {".txt", ".docx", ".xlsx", ".pptx"}
-RESTORE_SUFFIXES = {".txt", ".docx"}
+SUPPORTED_SUFFIXES = {".txt", ".docx"}
 SAFE_SUFFIX_RE = re.compile(r"_SAFE(?:_[0-9A-Fa-f]{8})?")
 CONTENT_TYPES = {
     ".txt": "text/plain; charset=utf-8",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+UNSUPPORTED_MESSAGE = "Поддерживаются только TXT и DOCX."
+SOURCE_LABELS = {
+    "explicit": "выбран вами",
+    "properties": "по номеру внутри DOCX",
+    "filename": "по номеру в имени файла",
+    "properties+filename": "по номеру внутри DOCX и в имени файла",
 }
 
 
 class WebRequestError(RuntimeError):
     """Raised when a local UI request is incomplete or unsupported."""
+
+
+class UnsupportedFileError(WebRequestError):
+    """Raised for file types other than TXT and DOCX."""
 
 
 @dataclass(frozen=True)
@@ -96,21 +112,78 @@ class GatewayWebApp:
             if method == "POST" and path == "/restore":
                 return self._restore(environ, start_response)
             return _json_response(start_response, "404 Not Found", {"error": "Страница не найдена."})
+        except UnsupportedFileError as exc:
+            return _json_response(start_response, "415 Unsupported Media Type", {"error": str(exc)})
         except WebRequestError as exc:
             return _json_response(start_response, "400 Bad Request", {"error": str(exc)})
+        except UnknownPlaceholdersError as exc:
+            return _json_response(
+                start_response,
+                "422 Unprocessable Entity",
+                {
+                    "code": "unknown_placeholders",
+                    "error": (
+                        f"Файл не относится к документу {exc.document_id}: в нём есть метки, "
+                        f"которых нет в этом документе ({', '.join(exc.unknown)}). Итоговый файл не создан."
+                    ),
+                },
+            )
         except RestoreError as exc:
             return _json_response(start_response, "422 Unprocessable Entity", {"error": str(exc)})
+        except InvalidDocumentIdError:
+            return _json_response(
+                start_response,
+                "400 Bad Request",
+                {"error": "Некорректный номер документа: нужно 8 символов 0-9 и A-F, например 39F3C1EE."},
+            )
+        except DocumentIdNotFoundError as exc:
+            if exc.source == SOURCE_EXPLICIT:
+                message = f"Документ {exc.document_id} не найден в базе. Другой документ автоматически не подбирается."
+            else:
+                message = (
+                    f"Документ {exc.document_id} не найден в базе ({SOURCE_LABELS[exc.source]}). "
+                    "Возможно, его удалили из базы или файл относится к другой копии программы."
+                )
+            return _json_response(start_response, "404 Not Found", {"code": "document_not_found", "error": message})
+        except DocumentIdConflictError as exc:
+            options = describe_conflict(exc)
+            return _json_response(
+                start_response,
+                "409 Conflict",
+                {
+                    "code": "id_conflict",
+                    "error": (
+                        f"Номер в имени файла ({exc.filename_id}) и номер внутри документа ({exc.properties_id}) "
+                        "указывают на разные документы. Выберите правильный документ."
+                    ),
+                    "candidates": [
+                        {
+                            "id": info.id,
+                            "source_name": info.source_name,
+                            "created_at": info.created_at,
+                            "hint": SOURCE_LABELS[source],
+                        }
+                        for source, _number, info in options
+                        if info is not None
+                    ],
+                },
+            )
         except AmbiguousDocumentError as exc:
             return _json_response(
                 start_response,
                 "409 Conflict",
                 {
-                    "error": "Файлу подходят несколько документов из базы. Выберите нужный.",
+                    "code": "choose_document",
+                    "error": "В файле нет номера документа. Выберите исходный документ.",
                     "candidates": [
                         {
                             "id": candidate.id,
                             "source_name": candidate.source_name,
                             "created_at": candidate.created_at,
+                            "hint": (
+                                f"нет в файле: {candidate.missing_placeholders} "
+                                f"из {candidate.total_placeholders} меток"
+                            ),
                         }
                         for candidate in exc.candidates
                     ],
@@ -146,8 +219,8 @@ class GatewayWebApp:
         document = _required_upload(form, "document")
         source_name = _safe_filename(document.filename)
         suffix = Path(source_name).suffix.lower()
-        if suffix not in ANONYMIZE_SUFFIXES:
-            raise WebRequestError("Поддерживаются TXT, DOCX, XLSX и PPTX.")
+        if suffix not in SUPPORTED_SUFFIXES:
+            raise UnsupportedFileError(UNSUPPORTED_MESSAGE)
 
         document_id = new_document_id()
         with tempfile.TemporaryDirectory(prefix="secure_gateway_") as tmp:
@@ -186,8 +259,8 @@ class GatewayWebApp:
 
         source_name = _safe_filename(document.filename)
         suffix = Path(source_name).suffix.lower()
-        if suffix not in RESTORE_SUFFIXES:
-            raise WebRequestError("Восстановление сейчас поддерживает TXT и DOCX.")
+        if suffix not in SUPPORTED_SUFFIXES:
+            raise UnsupportedFileError(UNSUPPORTED_MESSAGE)
 
         with tempfile.TemporaryDirectory(prefix="secure_gateway_") as tmp:
             workspace = Path(tmp)
@@ -195,12 +268,13 @@ class GatewayWebApp:
             input_path.write_bytes(document.data)
             text = extract_office_text(input_path) if suffix == ".docx" else input_path.read_text(encoding="utf-8")
 
-            document_id = resolve_document_id(input_path, text, self.db_path, explicit_id=chosen_id)
+            resolution = resolve_document_id(input_path, text, self.db_path, explicit_id=chosen_id)
+            document_id = resolution.id
             mapping = load_mapping(document_id, self.db_path)
             final_path = workspace / f"{_strip_safe_suffix(input_path.stem)}_FINAL{input_path.suffix or '.txt'}"
 
             if suffix == ".docx":
-                restore_docx_file(input_path, final_path, mapping)
+                result = restore_docx_file(input_path, final_path, mapping)
             else:
                 result = restore_text(text, mapping)
                 final_path.write_text(result.text, encoding="utf-8")
@@ -211,7 +285,12 @@ class GatewayWebApp:
             final_data,
             final_path.name,
             CONTENT_TYPES[suffix],
-            extra_headers=(("X-Document-Id", document_id),),
+            extra_headers=(
+                ("X-Document-Id", document_id),
+                ("X-Document-Source", resolution.source),
+                ("X-Missing-Count", str(len(result.missing))),
+                ("X-Missing-Placeholders", ",".join(result.missing)),
+            ),
         )
 
 
@@ -418,19 +497,19 @@ PAGE_HTML = """<!doctype html>
         <h2>Создать безопасную копию</h2>
         <p class="card-copy">Загрузите рабочий документ. Скачается SAFE-файл, а убранные значения сохранятся в локальной базе под номером документа.</p>
         <label class="drop-zone">
-          <input type="file" name="document" accept=".txt,.docx,.xlsx,.pptx" required>
+          <input type="file" name="document" accept=".txt,.docx" required>
           <span class="drop-title">Выберите или перетащите документ</span>
           <span class="file-name">Файл не выбран</span>
         </label>
-        <p class="formats">TXT, DOCX, XLSX, PPTX · до 100 МБ</p>
+        <p class="formats">TXT, DOCX · до 100 МБ</p>
         <button type="submit">Обезличить и скачать</button>
         <div class="status" role="status" aria-live="polite"></div>
       </form>
 
       <form class="card" data-endpoint="/restore">
         <span class="step">02</span>
-        <h2>Восстановить DOCX</h2>
-        <p class="card-copy">Загрузите обезличенный файл или ответ AI. Документ и его значения будут найдены в локальной базе автоматически.</p>
+        <h2>Восстановить документ</h2>
+        <p class="card-copy">Загрузите обезличенный файл или ответ AI. Документ находится по его номеру; если номера в файле нет, программа предложит выбрать документ из базы.</p>
         <label class="drop-zone">
           <input type="file" name="document" accept=".txt,.docx" required>
           <span class="drop-title">SAFE-документ</span>
@@ -473,7 +552,7 @@ PAGE_HTML = """<!doctype html>
         button.type = 'button';
         button.textContent = candidate.source_name;
         const details = document.createElement('small');
-        details.textContent = `№ ${candidate.id} · ${candidate.created_at}`;
+        details.textContent = `№ ${candidate.id} · ${candidate.created_at}` + (candidate.hint ? ` · ${candidate.hint}` : '');
         button.appendChild(details);
         button.addEventListener('click', () => {
           idField.value = candidate.id;
@@ -522,7 +601,7 @@ PAGE_HTML = """<!doctype html>
           const response = await fetch(form.dataset.endpoint, { method: 'POST', body: new FormData(form) });
           if (!response.ok) {
             const payload = await response.json().catch(() => ({}));
-            if (response.status === 409 && payload.candidates) showChoices(form, payload.candidates);
+            if (response.status === 409 && payload.candidates && payload.candidates.length) showChoices(form, payload.candidates);
             throw new Error(payload.error || 'Операция не выполнена.');
           }
           if (!isAnonymize) resetChoice(form);
@@ -540,7 +619,21 @@ PAGE_HTML = """<!doctype html>
             status.innerHTML = 'Готово. Документ сохранён в базе под номером <strong></strong>. Во внешнюю AI-систему передавайте только SAFE-файл.';
             status.querySelector('strong').textContent = documentId;
           } else {
-            status.textContent = 'Готово. Файл отправлен в загрузки браузера.';
+            const sourceLabels = {
+              'explicit': 'выбран вами',
+              'properties': 'по номеру внутри DOCX',
+              'filename': 'по номеру в имени файла',
+              'properties+filename': 'по номеру внутри DOCX и в имени файла',
+            };
+            const documentId = response.headers.get('X-Document-Id') || '';
+            const source = sourceLabels[response.headers.get('X-Document-Source')] || '';
+            const missingCount = Number(response.headers.get('X-Missing-Count') || '0');
+            const missingKeys = response.headers.get('X-Missing-Placeholders') || '';
+            let message = `Готово. Документ № ${documentId}` + (source ? ` (${source})` : '') + '. Файл отправлен в загрузки браузера.';
+            if (missingCount > 0) {
+              message += ` Внимание: в файле нет ${missingCount} меток документа (вероятно, удалены при редактировании): ${missingKeys}.`;
+            }
+            status.textContent = message;
           }
         } catch (error) {
           status.className = 'status error';

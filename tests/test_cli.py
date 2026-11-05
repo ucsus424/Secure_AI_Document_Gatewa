@@ -1,6 +1,7 @@
 import io
 import json
 import re
+from contextlib import closing
 import sqlite3
 import tempfile
 import unittest
@@ -52,7 +53,7 @@ def document_id_from(stdout_text):
 def count_documents(db_path):
     if not db_path.exists():
         return 0
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         return connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
 
 
@@ -258,7 +259,7 @@ class CliTests(CliTestCase):
         self.assertIn(str(final_path), stdout)
         self.assertEqual(stderr, "")
 
-    def test_restore_missing_placeholder_fails_without_writing_final(self):
+    def test_restore_removed_placeholder_warns_and_writes_final(self):
         init_db(self.db_path)
         save_document(
             "AB12CD34",
@@ -268,15 +269,87 @@ class CliTests(CliTestCase):
             ),
             self.db_path,
         )
-        safe_path = self.tmp / "result_SAFE.txt"
+        safe_path = self.tmp / "result_SAFE_AB12CD34.txt"
         safe_path.write_text("⟦PERSON_001⟧ настроил сеть.", encoding="utf-8")
 
         code, stdout, stderr = self.run_app(["restore", str(safe_path)])
 
-        self.assertNotEqual(code, 0)
+        self.assertEqual(code, 0, stderr)
+        final_path = self.tmp / "result_FINAL.txt"
+        self.assertEqual(final_path.read_text(encoding="utf-8"), "Петров А.В. настроил сеть.")
+        self.assertIn("missing=1", stdout)
+        self.assertIn("Warning", stdout)
+        self.assertIn("OBJECT_001", stdout)
+        self.assertNotIn("ВРН-Север-17", stdout)
+
+    def test_restore_placeholder_of_another_document_fails_without_final(self):
+        init_db(self.db_path)
+        save_document(
+            "AB12CD34",
+            Mapping.create(source_name="input.txt", entities={"PERSON_001": "Петров А.В."}),
+            self.db_path,
+        )
+        safe_path = self.tmp / "result_SAFE_AB12CD34.txt"
+        safe_path.write_text("⟦PERSON_001⟧ настроил ⟦IP_001⟧.", encoding="utf-8")
+
+        code, stdout, stderr = self.run_app(["restore", str(safe_path)])
+
+        self.assertEqual(code, 1)
         self.assertFalse((self.tmp / "result_FINAL.txt").exists())
-        self.assertIn("OBJECT_001", stderr)
-        self.assertNotIn("Петров А.В.", stderr)
+        self.assertIn("IP_001", stderr)
+        self.assertIn("AB12CD34", stderr)
+        self.assertNotIn("Петров", stderr)
+
+    def test_restore_unknown_explicit_number_does_not_fall_back(self):
+        init_db(self.db_path)
+        save_document(
+            "AB12CD34",
+            Mapping.create(source_name="input.txt", entities={"PERSON_001": "Петров А.В."}),
+            self.db_path,
+        )
+        safe_path = self.tmp / "result_SAFE_AB12CD34.txt"
+        safe_path.write_text("⟦PERSON_001⟧ настроил сеть.", encoding="utf-8")
+
+        code, stdout, stderr = self.run_app(["restore", str(safe_path), "FFFFFFFF"])
+
+        self.assertEqual(code, 1)
+        self.assertFalse((self.tmp / "result_FINAL.txt").exists())
+        self.assertIn("FFFFFFFF", stderr)
+        self.assertIn("No other document is chosen automatically", stderr)
+
+    def test_restore_invalid_explicit_number_fails(self):
+        answer_path = self.tmp / "answer.txt"
+        answer_path.write_text("⟦PERSON_001⟧", encoding="utf-8")
+
+        code, stdout, stderr = self.run_app(["restore", str(answer_path), "12345"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("Invalid document number", stderr)
+
+    def test_restore_single_candidate_still_asks_for_number(self):
+        init_db(self.db_path)
+        save_document(
+            "AB12CD34",
+            Mapping.create(source_name="input.txt", entities={"PERSON_001": "Петров А.В."}),
+            self.db_path,
+        )
+        answer_path = self.tmp / "answer.txt"
+        answer_path.write_text("⟦PERSON_001⟧ настроил сеть.", encoding="utf-8")
+
+        code, stdout, stderr = self.run_app(["restore", str(answer_path)])
+
+        self.assertEqual(code, 1)
+        self.assertIn("AB12CD34", stderr)
+        self.assertFalse((self.tmp / "answer_FINAL.txt").exists())
+
+    def test_unsupported_formats_are_rejected(self):
+        for name in ("plan.xlsx", "deck.pptx"):
+            path = self.tmp / name
+            path.write_bytes(b"PK")
+            for command in (["anonymize", str(path)], ["restore", str(path)], ["scan", str(path)]):
+                code, stdout, stderr = self.run_app(command, FakeDetector())
+                self.assertEqual(code, 1, command)
+                self.assertIn("Only TXT and DOCX", stderr)
 
     def test_restore_unknown_document_fails(self):
         safe_path = self.tmp / "result_SAFE.txt"
@@ -321,10 +394,16 @@ class CliTests(CliTestCase):
         document_id = document_id_from(stdout)
         safe_path = self.tmp / f"input_SAFE_{document_id}.txt"
 
+        # Ответ модели сохранён под другим именем: номера в нём нет,
+        # поэтому программа просит указать документ и ничего не угадывает.
         answer_path = self.tmp / "claude_answer.txt"
         answer_path.write_text(safe_path.read_text(encoding="utf-8"), encoding="utf-8")
 
         code, _, stderr = self.run_app(["restore", str(answer_path)])
+        self.assertEqual(code, 1)
+        self.assertIn(document_id, stderr)
+
+        code, _, stderr = self.run_app(["restore", str(answer_path), document_id])
 
         self.assertEqual(code, 0, stderr)
         self.assertEqual((self.tmp / "claude_answer_FINAL.txt").read_text(encoding="utf-8"), original)

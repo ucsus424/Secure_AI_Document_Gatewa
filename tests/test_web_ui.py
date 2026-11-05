@@ -1,5 +1,6 @@
 import io
 import json
+from contextlib import closing
 import sqlite3
 import tempfile
 import unittest
@@ -59,7 +60,7 @@ class WebUiTests(unittest.TestCase):
         )
 
     def count_documents(self):
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection:
             return connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
 
     def test_home_page_exposes_local_anonymize_and_restore_workflows(self):
@@ -69,8 +70,9 @@ class WebUiTests(unittest.TestCase):
         self.assertEqual(status, "200 OK")
         self.assertIn("text/html", headers["Content-Type"])
         self.assertIn("Создать безопасную копию", html)
-        self.assertIn("Восстановить DOCX", html)
-        self.assertIn('name="document_id"', html)
+        self.assertIn("Восстановить документ", html)
+        self.assertIn('type="hidden" name="document_id"', html)
+        self.assertNotIn("Номер документа", html)
         self.assertNotIn("mapping.json", html)
         self.assertIn("127.0.0.1", html)
 
@@ -132,39 +134,85 @@ class WebUiTests(unittest.TestCase):
         self.assertNotIn("user@example.com", payload["error"])
         self.assertEqual(self.count_documents(), 0)
 
-    def test_restore_txt_by_document_id(self):
+    def test_restore_txt_uses_number_from_file_name(self):
         self.save_values("AB12CD34", {"PERSON_001": "Петров А.В."})
+        self.save_values("EF56AB78", {"PERSON_001": "Иванов С.П."})
 
         status, headers, body = _request(
             self.app,
             "POST",
             "/restore",
             files={"document": ("result_SAFE_AB12CD34.txt", "⟦PERSON_001⟧ на объекте.".encode("utf-8"), "text/plain")},
-            fields={"document_id": "ab12cd34"},
         )
 
         self.assertEqual(status, "200 OK")
+        self.assertEqual(headers["X-Document-Id"], "AB12CD34")
+        self.assertEqual(headers["X-Document-Source"], "filename")
+        self.assertEqual(headers["X-Missing-Count"], "0")
         self.assertIn("result_FINAL.txt", headers["Content-Disposition"])
         self.assertEqual(body.decode("utf-8"), "Петров А.В. на объекте.")
 
-    def test_restore_requires_document_id(self):
+    def test_restore_without_number_asks_to_choose_even_one_document(self):
+        self.save_values("AB12CD34", {"PERSON_001": "Петров А.В.", "IP_001": "10.74.16.1/24"})
+        self.save_values("EF56AB78", {"PERSON_001": "Иванов С.П."})
+        upload = {"document": ("answer.txt", "⟦PERSON_001⟧ настроил ⟦IP_001⟧.".encode("utf-8"), "text/plain")}
+
+        status, headers, body = _request(self.app, "POST", "/restore", files=upload)
+
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(payload["code"], "choose_document")
+        self.assertEqual([item["id"] for item in payload["candidates"]], ["AB12CD34"])
+        self.assertIn("0 из 2", payload["candidates"][0]["hint"])
+
         status, headers, body = _request(
-            self.app,
-            "POST",
-            "/restore",
-            files={"document": ("result_SAFE.txt", "⟦PERSON_001⟧".encode("utf-8"), "text/plain")},
+            self.app, "POST", "/restore", files=upload, fields={"document_id": "AB12CD34"}
         )
 
-        self.assertEqual(status, "400 Bad Request")
-        self.assertIn("номер", json.loads(body.decode("utf-8"))["error"])
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(headers["X-Document-Source"], "explicit")
+        self.assertEqual(body.decode("utf-8"), "Петров А.В. настроил 10.74.16.1/24.")
 
-    def test_restore_unknown_document_id_returns_not_found(self):
+    def test_task_scenario_edited_file_is_not_restored_with_wrong_person(self):
+        # Иванов и Петров оба имеют ⟦PERSON_001⟧; из файла Петрова удалили ⟦IP_001⟧ и переименовали.
+        self.save_values("AB12CD34", {"PERSON_001": "Иванов С.П."})
+        self.save_values("EF56AB78", {"PERSON_001": "Петров А.В.", "IP_001": "10.74.16.1/24"})
+        upload = {"document": ("renamed.txt", "⟦PERSON_001⟧ на объекте.".encode("utf-8"), "text/plain")}
+
+        status, headers, body = _request(self.app, "POST", "/restore", files=upload)
+
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual({item["id"] for item in payload["candidates"]}, {"AB12CD34", "EF56AB78"})
+        self.assertNotIn("Иванов", body.decode("utf-8"))
+        self.assertNotIn("Петров", body.decode("utf-8"))
+
+    def test_restore_offers_choice_when_several_documents_match(self):
+        self.save_values("AB12CD34", {"PERSON_001": "Петров А.В."})
+        self.save_values("EF56AB78", {"PERSON_001": "Иванов С.П."})
+        upload = {"document": ("answer.txt", "⟦PERSON_001⟧ на объекте.".encode("utf-8"), "text/plain")}
+
+        status, headers, body = _request(self.app, "POST", "/restore", files=upload)
+
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(payload["code"], "choose_document")
+        self.assertEqual({item["id"] for item in payload["candidates"]}, {"AB12CD34", "EF56AB78"})
+        self.assertNotIn("Петров", body.decode("utf-8"))
+
+        status, headers, body = _request(
+            self.app, "POST", "/restore", files=upload, fields={"document_id": "EF56AB78"}
+        )
+
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body.decode("utf-8"), "Иванов С.П. на объекте.")
+
+    def test_restore_file_without_known_placeholders_returns_not_found(self):
         status, headers, body = _request(
             self.app,
             "POST",
             "/restore",
-            files={"document": ("result_SAFE.txt", "⟦PERSON_001⟧".encode("utf-8"), "text/plain")},
-            fields={"document_id": "FFFFFFFF"},
+            files={"document": ("answer.txt", "⟦PERSON_001⟧".encode("utf-8"), "text/plain")},
         )
 
         self.assertEqual(status, "404 Not Found")
@@ -179,12 +227,14 @@ class WebUiTests(unittest.TestCase):
             files={"document": ("input.txt", original.encode("utf-8"), "text/plain")},
         )
 
+        document_id = headers["X-Document-Id"]
+        upload = {"document": ("answer.txt", safe_body, "text/plain")}
+
+        status, _, body = _request(self.app, "POST", "/restore", files=upload)
+        self.assertEqual(status, "409 Conflict")
+
         status, headers, body = _request(
-            self.app,
-            "POST",
-            "/restore",
-            files={"document": ("answer.txt", safe_body, "text/plain")},
-            fields={"document_id": headers["X-Document-Id"]},
+            self.app, "POST", "/restore", files=upload, fields={"document_id": document_id}
         )
 
         self.assertEqual(status, "200 OK")
@@ -203,7 +253,6 @@ class WebUiTests(unittest.TestCase):
             "POST",
             "/restore",
             files={"document": ("result_SAFE_AB12CD34.docx", safe_bytes.getvalue(), DOCX_TYPE)},
-            fields={"document_id": "AB12CD34"},
         )
 
         self.assertEqual(status, "200 OK")
@@ -213,7 +262,7 @@ class WebUiTests(unittest.TestCase):
         self.assertEqual(restored.paragraphs[0].text, "Инженер Петров А.В. на объекте.")
 
     @unittest.skipUnless(Document is not None, "python-docx is unavailable")
-    def test_restore_missing_placeholder_returns_safe_error(self):
+    def test_restore_removed_placeholder_is_a_warning(self):
         self.save_values(
             "AB12CD34",
             {"PERSON_001": "Петров А.В.", "OBJECT_001": "ВРН-Север-17"},
@@ -228,14 +277,105 @@ class WebUiTests(unittest.TestCase):
             "POST",
             "/restore",
             files={"document": ("result_SAFE_AB12CD34.docx", safe_bytes.getvalue(), DOCX_TYPE)},
-            fields={"document_id": "AB12CD34"},
+        )
+
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(headers["X-Missing-Count"], "1")
+        self.assertEqual(headers["X-Missing-Placeholders"], "OBJECT_001")
+        restored = Document(io.BytesIO(body))
+        self.assertEqual(restored.paragraphs[0].text, "Инженер Петров А.В. на объекте.")
+
+    def test_restore_placeholder_of_another_document_returns_error(self):
+        self.save_values("AB12CD34", {"PERSON_001": "Петров А.В."})
+
+        status, headers, body = _request(
+            self.app,
+            "POST",
+            "/restore",
+            files={"document": ("result_SAFE_AB12CD34.txt", "⟦PERSON_001⟧ и ⟦IP_001⟧".encode("utf-8"), "text/plain")},
         )
 
         payload = json.loads(body.decode("utf-8"))
         self.assertEqual(status, "422 Unprocessable Entity")
-        self.assertIn("application/json", headers["Content-Type"])
-        self.assertIn("OBJECT_001", payload["error"])
-        self.assertNotIn("Петров А.В.", payload["error"])
+        self.assertEqual(payload["code"], "unknown_placeholders")
+        self.assertIn("IP_001", payload["error"])
+        self.assertNotIn("Петров", payload["error"])
+
+    def test_restore_unknown_chosen_number_does_not_fall_back(self):
+        self.save_values("AB12CD34", {"PERSON_001": "Петров А.В."})
+
+        status, headers, body = _request(
+            self.app,
+            "POST",
+            "/restore",
+            files={"document": ("result_SAFE_AB12CD34.txt", "⟦PERSON_001⟧".encode("utf-8"), "text/plain")},
+            fields={"document_id": "FFFFFFFF"},
+        )
+
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, "404 Not Found")
+        self.assertIn("FFFFFFFF", payload["error"])
+
+    def test_restore_unknown_number_in_file_name_does_not_fall_back(self):
+        self.save_values("AB12CD34", {"PERSON_001": "Петров А.В."})
+
+        status, headers, body = _request(
+            self.app,
+            "POST",
+            "/restore",
+            files={"document": ("result_SAFE_FFFFFFFF.txt", "⟦PERSON_001⟧".encode("utf-8"), "text/plain")},
+        )
+
+        self.assertEqual(status, "404 Not Found")
+        self.assertIn("FFFFFFFF", json.loads(body.decode("utf-8"))["error"])
+
+    @unittest.skipUnless(Document is not None, "python-docx is unavailable")
+    def test_restore_reports_number_mismatch(self):
+        from core.office import write_document_id
+
+        self.save_values("AB12CD34", {"PERSON_001": "Петров А.В."})
+        self.save_values("EF56AB78", {"PERSON_001": "Иванов С.П."})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "doc.docx"
+            document = Document()
+            document.add_paragraph("⟦PERSON_001⟧")
+            document.save(path)
+            write_document_id(path, "EF56AB78")
+            data = path.read_bytes()
+
+        status, headers, body = _request(
+            self.app,
+            "POST",
+            "/restore",
+            files={"document": ("result_SAFE_AB12CD34.docx", data, DOCX_TYPE)},
+        )
+
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(payload["code"], "id_conflict")
+        self.assertIn("AB12CD34", payload["error"])
+        self.assertIn("EF56AB78", payload["error"])
+        self.assertEqual({item["id"] for item in payload["candidates"]}, {"AB12CD34", "EF56AB78"})
+
+    def test_unsupported_formats_are_rejected(self):
+        for name in ("plan.xlsx", "deck.pptx"):
+            for endpoint in ("/anonymize", "/restore"):
+                status, headers, body = _request(
+                    self.app,
+                    "POST",
+                    endpoint,
+                    files={"document": (name, b"PK", "application/octet-stream")},
+                )
+                self.assertEqual(status, "415 Unsupported Media Type", (name, endpoint))
+                self.assertIn("TXT и DOCX", json.loads(body.decode("utf-8"))["error"])
+
+    def test_home_page_lists_only_txt_and_docx(self):
+        status, headers, body = _request(self.app, "GET", "/")
+
+        html = body.decode("utf-8")
+        self.assertNotIn(".xlsx", html)
+        self.assertNotIn(".pptx", html)
+        self.assertIn("TXT, DOCX", html)
 
 
 def _request(app, method, path, files=None, fields=None):

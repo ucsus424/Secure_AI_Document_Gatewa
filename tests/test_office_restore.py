@@ -7,6 +7,7 @@ from pathlib import Path
 import app
 from core.database import init_db, save_document
 from core.models import Entity, Mapping
+from core.office import read_document_id
 
 
 try:
@@ -40,7 +41,7 @@ class DocxRestoreTests(unittest.TestCase):
             stdout = io.StringIO()
             stderr = io.StringIO()
             code = app.run(
-                ["restore", "--db", str(db_path), str(safe_path), "AB12CD34"],
+                ["restore", "--db", str(db_path), str(safe_path)],
                 stdout=stdout,
                 stderr=stderr,
             )
@@ -76,7 +77,7 @@ class DocxRestoreTests(unittest.TestCase):
             _save_values(db_path, "AB12CD34", {"PERSON_001": "Петров А.В."})
 
             code = app.run(
-                ["restore", "--db", str(db_path), str(safe_path), "AB12CD34"],
+                ["restore", "--db", str(db_path), str(safe_path)],
                 stdout=io.StringIO(),
                 stderr=io.StringIO(),
             )
@@ -113,21 +114,21 @@ class DocxRestoreTests(unittest.TestCase):
             )
             self.assertEqual(anonymize_code, 0)
             document_id = re.search(r"Document ID: ([0-9A-F]{8})", anonymize_stdout.getvalue()).group(1)
+            safe_path = Path(tmp) / f"styled_SAFE_{document_id}.docx"
+            self.assertEqual(read_document_id(safe_path), document_id)
 
+            # Simulate an AI answer saved under a different name: the number is
+            # found in the document properties, not in the file name.
+            answer_path = Path(tmp) / "answer.docx"
+            answer_path.write_bytes(safe_path.read_bytes())
             restore_code = app.run(
-                [
-                    "restore",
-                    "--db",
-                    str(db_path),
-                    str(Path(tmp) / f"styled_SAFE_{document_id}.docx"),
-                    document_id,
-                ],
+                ["restore", "--db", str(db_path), str(answer_path)],
                 stdout=io.StringIO(),
                 stderr=io.StringIO(),
             )
             self.assertEqual(restore_code, 0)
 
-            final_document = Document(Path(tmp) / "styled_FINAL.docx")
+            final_document = Document(Path(tmp) / "answer_FINAL.docx")
             final_paragraph = final_document.paragraphs[0]
             self.assertEqual(final_paragraph.text, "Перед Петров А.В. после")
             self.assertTrue(
@@ -137,7 +138,7 @@ class DocxRestoreTests(unittest.TestCase):
                 any(run.text == " после" and run.italic for run in final_paragraph.runs)
             )
 
-    def test_restore_missing_placeholder_fails_without_final_docx(self):
+    def test_restore_removed_placeholder_warns_and_writes_final_docx(self):
         with tempfile.TemporaryDirectory() as tmp:
             safe_path = Path(tmp) / "result_SAFE_AB12CD34.docx"
             db_path = Path(tmp) / "test.db"
@@ -157,16 +158,39 @@ class DocxRestoreTests(unittest.TestCase):
             stdout = io.StringIO()
             stderr = io.StringIO()
             code = app.run(
-                ["restore", "--db", str(db_path), str(safe_path), "AB12CD34"],
+                ["restore", "--db", str(db_path), str(safe_path)],
                 stdout=stdout,
                 stderr=stderr,
             )
 
-            self.assertNotEqual(code, 0)
+            self.assertEqual(code, 0, stderr.getvalue())
+            final_document = Document(Path(tmp) / "result_FINAL.docx")
+            self.assertEqual(final_document.paragraphs[0].text, "Инженер Петров А.В. прибыл на объект.")
+            self.assertIn("OBJECT_001", stdout.getvalue())
+            self.assertNotIn("ВРН-Север-17", stdout.getvalue())
+
+    def test_restore_placeholder_of_another_document_fails_without_final_docx(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            safe_path = Path(tmp) / "result_SAFE_AB12CD34.docx"
+            db_path = Path(tmp) / "test.db"
+
+            document = Document()
+            document.add_paragraph("Инженер ⟦PERSON_001⟧ настроил ⟦IP_001⟧.")
+            document.save(safe_path)
+            _save_values(db_path, "AB12CD34", {"PERSON_001": "Петров А.В."})
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            code = app.run(
+                ["restore", "--db", str(db_path), str(safe_path)],
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(code, 1)
             self.assertFalse((Path(tmp) / "result_FINAL.docx").exists())
-            self.assertIn("OBJECT_001", stderr.getvalue())
+            self.assertIn("IP_001", stderr.getvalue())
             self.assertNotIn("Петров А.В.", stderr.getvalue())
-            self.assertEqual(stdout.getvalue(), "")
 
 
 def _save_values(db_path, document_id, entities):
