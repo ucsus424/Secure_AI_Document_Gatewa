@@ -42,6 +42,7 @@ from core.office import (
     restore_docx_file,
     write_document_id,
 )
+from core.residuals import ResidualValuesError, require_no_residual_values
 from core.restore import RestoreError, UnknownPlaceholdersError, restore_text
 
 
@@ -198,6 +199,18 @@ class GatewayWebApp:
                 "404 Not Found",
                 {"error": "Для этого файла не найден документ в базе. Загрузите SAFE-файл, полученный из этой программы."},
             )
+        except ResidualValuesError as exc:
+            return _json_response(
+                start_response,
+                "422 Unprocessable Entity",
+                {
+                    "code": "residual_values",
+                    "error": (
+                        "Обезличивание остановлено: в SAFE-файле остались бы чувствительные данные "
+                        f"({', '.join(exc.keys)}). Файл не создан, в базу ничего не записано."
+                    ),
+                },
+            )
         except DetectorError:
             return _json_response(
                 start_response,
@@ -237,6 +250,7 @@ class GatewayWebApp:
             if text.strip() and not result.mapping.entities:
                 raise DetectorError("detector returned no replaceable entities")
             require_no_obvious_entities(result.text)
+            require_no_residual_values(result.text, result.mapping)
 
             safe_path = workspace / f"{input_path.stem}_SAFE_{document_id}{input_path.suffix or '.txt'}"
             if is_supported_office_file(input_path):

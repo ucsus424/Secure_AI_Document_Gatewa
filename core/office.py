@@ -7,6 +7,7 @@ from lxml import etree
 from zipfile import BadZipFile, ZipFile
 
 from core.models import Mapping, format_placeholder
+from core.residuals import ResidualValuesError, find_residual_keys
 from core.restore import RestoreResult, restore_text
 
 
@@ -101,7 +102,7 @@ def anonymize_office_file(input_path: Path, output_path: Path, mapping: Mapping)
     except (BadZipFile, OSError, *XML_ERRORS) as exc:
         _remove_if_exists(temporary_path)
         raise OfficeAnonymizationError("Office file could not be anonymized") from exc
-    except OfficeAnonymizationError:
+    except (OfficeAnonymizationError, ResidualValuesError):
         _remove_if_exists(temporary_path)
         raise
 
@@ -164,13 +165,24 @@ def _replace_xml_text(
 ) -> bytes:
     root = _parse_xml(data)
     changed = False
+    groups = list(_iter_matching(root, office_format.group_tags))
 
-    for group in _iter_matching(root, office_format.group_tags):
+    # 1. Обычный случай: значение целиком внутри одного абзаца.
+    for group in groups:
         nodes = _text_nodes(group, office_format)
         if not nodes:
             continue
         if _replace_text_nodes(nodes, replacements):
             changed = True
+
+    # 2. Значение разбито на несколько соседних абзацев (каждая строка через Enter).
+    #    В извлечённом тексте абзацы разделены "\n", поэтому такие значения
+    #    содержат перенос строки.
+    multiline = [(original, replacement) for original, replacement in replacements if "\n" in original]
+    if multiline:
+        for block in _paragraph_blocks(groups):
+            if _replace_across_paragraphs(block, office_format, multiline):
+                changed = True
 
     if not changed:
         return data
@@ -240,6 +252,131 @@ def _replace_text_nodes(
     return changed
 
 
+# Элементы, которые могут стоять между абзацами и не разрывают «блок» соседних абзацев.
+TRANSPARENT_BETWEEN_PARAGRAPHS = {
+    "bookmarkStart",
+    "bookmarkEnd",
+    "proofErr",
+    "permStart",
+    "permEnd",
+    "commentRangeStart",
+    "commentRangeEnd",
+}
+
+
+def _paragraph_blocks(groups: Sequence[etree._Element]) -> List[List[etree._Element]]:
+    """Runs of neighbouring paragraphs with the same parent.
+
+    A table, a section break or another block element between paragraphs
+    ends the run, and paragraphs of different table cells never mix.
+    """
+    paragraphs = set(groups)
+    blocks: List[List[etree._Element]] = []
+    for group in groups:
+        previous = _previous_significant_sibling(group)
+        if blocks and previous is not None and previous is blocks[-1][-1] and previous in paragraphs:
+            blocks[-1].append(group)
+        else:
+            blocks.append([group])
+    return [block for block in blocks if len(block) > 1]
+
+
+def _previous_significant_sibling(element: etree._Element) -> Optional[etree._Element]:
+    sibling = element.getprevious()
+    while sibling is not None:
+        if isinstance(sibling.tag, str) and _split_tag(sibling.tag)[1] not in TRANSPARENT_BETWEEN_PARAGRAPHS:
+            return sibling
+        sibling = sibling.getprevious()
+    return None
+
+
+def _replace_across_paragraphs(
+    block: Sequence[etree._Element],
+    office_format: OfficeFormat,
+    replacements: Sequence[Tuple[str, str]],
+) -> bool:
+    """Replace values that continue from one paragraph into the next ones.
+
+    The placeholder goes where the value starts. The rest of the value is
+    removed from the following paragraphs; the paragraphs themselves (and
+    their formatting) stay. Text after the value in its last paragraph is
+    moved right after the placeholder, so «Название» stays on one line.
+    """
+    changed = False
+    node_lists = [_text_nodes(paragraph, office_format) for paragraph in block]
+
+    for original, replacement in replacements:
+        while True:
+            segments = _block_segments(node_lists)
+            combined = "".join(text for _, text in segments)
+            start = combined.find(original)
+            if start < 0:
+                break
+            _replace_segment_range(segments, start, start + len(original), replacement)
+            changed = True
+    return changed
+
+
+def _block_segments(
+    node_lists: Sequence[Sequence[etree._Element]],
+) -> List[Tuple[Optional[etree._Element], str]]:
+    """Text of a paragraph block as it appears in the extracted document text.
+
+    Empty paragraphs are skipped and non-empty ones are joined with "\n",
+    exactly like extract_office_text does.
+    """
+    segments: List[Tuple[Optional[etree._Element], str]] = []
+    for nodes in node_lists:
+        if not "".join(node.text or "" for node in nodes):
+            continue
+        if segments:
+            segments.append((None, "\n"))
+        segments.extend((node, node.text or "") for node in nodes)
+    return segments
+
+
+def _replace_segment_range(
+    segments: Sequence[Tuple[Optional[etree._Element], str]],
+    start: int,
+    end: int,
+    replacement: str,
+) -> None:
+    positions = []
+    offset = 0
+    for index, (_, text) in enumerate(segments):
+        positions.append(offset)
+        offset += len(text)
+
+    def locate(character: int) -> Tuple[int, int]:
+        for index, (_, text) in enumerate(segments):
+            if character < positions[index] + len(text):
+                return index, character - positions[index]
+        raise OfficeAnonymizationError("replacement range is outside the paragraph block")
+
+    start_index, start_offset = locate(start)
+    end_index, end_offset = locate(end - 1)
+    end_offset += 1
+
+    # Совпадение не должно начинаться или заканчиваться на разделителе абзацев.
+    while segments[start_index][0] is None:
+        start_index, start_offset = start_index + 1, 0
+    while segments[end_index][0] is None:
+        end_index -= 1
+        end_offset = len(segments[end_index][1])
+
+    start_node, start_text = segments[start_index]
+    if start_index == end_index:
+        _set_node_text(start_node, start_text[:start_offset] + replacement + start_text[end_offset:])
+        return
+
+    end_node, end_text = segments[end_index]
+    _set_node_text(start_node, start_text[:start_offset] + replacement + end_text[end_offset:])
+    for index in range(start_index + 1, end_index + 1):
+        node = segments[index][0]
+        if node is not None:
+            _set_node_text(node, "")
+
+
 def _replacement_starts(text: str, original: str) -> List[int]:
     starts: List[int] = []
     offset = 0
@@ -297,17 +434,10 @@ def _set_node_text(node: etree._Element, value: str) -> None:
 
 
 def _validate_no_residual_values(path: Path, mapping: Mapping) -> None:
-    text = extract_office_text(path)
-    residual_keys = [
-        key
-        for key, value in mapping.entities.items()
-        if value and value in text
-    ]
+    """Fail when a value is still in the SAFE file, whatever the spacing."""
+    residual_keys = find_residual_keys(extract_office_text(path), mapping)
     if residual_keys:
-        raise OfficeAnonymizationError(
-            "Office anonymization left residual sensitive placeholders: "
-            + ", ".join(residual_keys)
-        )
+        raise ResidualValuesError(residual_keys)
 
 
 def _validate_no_residual_placeholders(path: Path, mapping: Mapping) -> None:

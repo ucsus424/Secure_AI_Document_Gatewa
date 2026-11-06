@@ -400,6 +400,56 @@ class WebUiTests(unittest.TestCase):
         self.assertIn("EF56AB78", payload["error"])
         self.assertEqual({item["id"] for item in payload["candidates"]}, {"AB12CD34", "EF56AB78"})
 
+    @unittest.skipUnless(Document is not None, "python-docx is unavailable")
+    def test_anonymize_title_page_split_into_lines(self):
+        class UniversityDetector:
+            def detect_text(self, text):
+                return [Entity(type="COMPANY", value="Российский государственный университет нефти и газа имени И. М. Губкина")]
+
+        source = io.BytesIO()
+        document = Document()
+        for line in ("«Российский государственный университет нефти и газа", "имени И. М. Губкина»"):
+            document.add_paragraph(line)
+        document.save(source)
+
+        status, headers, body = _request(
+            self.make_app(UniversityDetector()),
+            "POST",
+            "/anonymize",
+            files={"document": ("title.docx", source.getvalue(), DOCX_TYPE)},
+        )
+
+        self.assertEqual(status, "200 OK")
+        texts = [paragraph.text for paragraph in Document(io.BytesIO(body)).paragraphs]
+        self.assertEqual(texts, ["«⟦COMPANY_001⟧»", ""])
+
+    @unittest.skipUnless(Document is not None, "python-docx is unavailable")
+    def test_anonymize_stops_when_value_would_stay_in_safe_file(self):
+        class SplitAcrossCellsDetector:
+            def detect_text(self, text):
+                return [Entity(type="PERSON", value="Петров Алексей")]
+
+        source = io.BytesIO()
+        document = Document()
+        table = document.add_table(rows=1, cols=2)
+        table.cell(0, 0).text = "Петров"
+        table.cell(0, 1).text = "Алексей"
+        document.save(source)
+
+        status, headers, body = _request(
+            self.make_app(SplitAcrossCellsDetector()),
+            "POST",
+            "/anonymize",
+            files={"document": ("table.docx", source.getvalue(), DOCX_TYPE)},
+        )
+
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, "422 Unprocessable Entity")
+        self.assertEqual(payload["code"], "residual_values")
+        self.assertIn("PERSON_001", payload["error"])
+        self.assertNotIn("Петров", payload["error"])
+        self.assertEqual(self.count_documents(), 0)
+
     def test_unsupported_formats_are_rejected(self):
         for name in ("plan.xlsx", "deck.pptx"):
             for endpoint in ("/anonymize", "/restore"):

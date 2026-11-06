@@ -9,6 +9,7 @@ from core.models import Entity, Mapping, format_placeholder
 
 FLEXIBLE_SURFACE_TYPES = {"PERSON", "COMPANY", "OBJECT"}
 WORD_TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
+SPACE_CLASS = r"[\s\u00a0\u2007\u202f\u2060]"
 
 
 @dataclass
@@ -84,6 +85,14 @@ def _surface_variants(text: str, entity: Entity) -> List[str]:
             variants.append(value)
 
     add(entity.value)
+
+    chunks = [chunk for chunk in re.split(SPACE_CLASS + "+", entity.value) if chunk]
+    if len(chunks) > 1:
+        spaced = re.compile(
+            (SPACE_CLASS + "+").join(re.escape(chunk) for chunk in chunks)
+        )
+        for match in spaced.finditer(text):
+            add(match.group(0))
 
     if entity.type not in FLEXIBLE_SURFACE_TYPES:
         return variants

@@ -45,6 +45,7 @@ from core.office import (
     restore_docx_file,
     write_document_id,
 )
+from core.residuals import ResidualValuesError, require_no_residual_values
 from core.restore import RestoreError, UnknownPlaceholdersError, restore_text
 
 
@@ -179,6 +180,7 @@ def _anonymize(
         if text.strip() and not result.mapping.entities:
             raise DetectorError("detector returned no replaceable entities")
         require_no_obvious_entities(result.text)
+        require_no_residual_values(result.text, result.mapping)
         if is_supported_office_file(args.input):
             anonymize_office_file(args.input, safe_path, result.mapping)
             write_document_id(safe_path, document_id)
@@ -187,6 +189,13 @@ def _anonymize(
         save_document(document_id, result.mapping, args.db)
     except DetectorError:
         stderr.write("Detection failed; no output written.\n")
+        return 1
+    except ResidualValuesError as exc:
+        _remove_if_exists(safe_path)
+        stderr.write(
+            "Anonymization stopped: sensitive values would stay in the SAFE file "
+            f"({', '.join(exc.keys)}). No SAFE file was written and nothing was saved to the database.\n"
+        )
         return 1
     except (OSError, DatabaseError, OfficeAnonymizationError, UnicodeDecodeError):
         _remove_if_exists(safe_path)

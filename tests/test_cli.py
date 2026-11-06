@@ -420,6 +420,33 @@ class CliTests(CliTestCase):
         self.assertIn("AB12CD34", stderr)
         self.assertFalse((self.tmp / "answer_FINAL.txt").exists())
 
+    def test_anonymize_stops_when_value_would_stay_in_safe_docx(self):
+        try:
+            from docx import Document
+        except ImportError:
+            self.skipTest("python-docx is unavailable")
+
+        class SplitAcrossCellsDetector:
+            def detect_text(self, text):
+                return [Entity(type="PERSON", value="Петров Алексей")]
+
+        path = self.tmp / "table.docx"
+        document = Document()
+        table = document.add_table(rows=1, cols=2)
+        table.cell(0, 0).text = "Петров"
+        table.cell(0, 1).text = "Алексей"
+        document.save(path)
+
+        code, stdout, stderr = self.run_app(
+            ["anonymize", "--output-dir", str(self.tmp / "out"), str(path)], SplitAcrossCellsDetector()
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIn("PERSON_001", stderr)
+        self.assertNotIn("Петров", stderr)
+        self.assertEqual(list((self.tmp / "out").glob("*")), [])
+        self.assertEqual(count_documents(self.db_path), 0)
+
     def test_unsupported_formats_are_rejected(self):
         for name in ("plan.xlsx", "deck.pptx"):
             path = self.tmp / name
