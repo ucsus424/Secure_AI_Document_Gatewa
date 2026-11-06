@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import re
+import socket
 import sys
 from pathlib import Path
 from typing import Callable, List, Optional, TextIO
@@ -87,11 +89,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional: document number; found automatically when omitted",
     )
 
-    ui = subparsers.add_parser("ui", help="start the local visual interface")
+    ui = subparsers.add_parser("ui", help="start the visual interface (local by default)")
     _add_detector_options(ui)
     _add_chunk_options(ui)
     _add_db_option(ui)
-    ui.add_argument("--host", choices=("127.0.0.1", "localhost"), default="127.0.0.1")
+    ui.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="address to listen on: 127.0.0.1 = this computer only (default), "
+        "0.0.0.0 = all network interfaces, or a specific IP of this server",
+    )
     ui.add_argument("--port", type=int, default=8765)
 
     return parser
@@ -286,26 +293,98 @@ def _ui(
 
     from web_ui import GatewayWebApp, serve
 
+    network_mode = not is_loopback_host(args.host)
     try:
         application = GatewayWebApp(
             detector_factory=lambda: detector_factory(args),
             chunk_lines=args.chunk_lines,
             db_path=args.db,
+            network_mode=network_mode,
         )
     except DatabaseError:
         stderr.write("Database could not be opened.\n")
         return 1
 
-    stdout.write(f"Local UI: http://{args.host}:{args.port}\n")
+    for line in startup_lines(args.host, args.port):
+        stdout.write(line + "\n")
     stdout.flush()
     try:
         serve(args.host, args.port, application)
     except OSError:
-        stderr.write("Local UI could not start.\n")
+        stderr.write(
+            f"UI could not start on {args.host}:{args.port}. "
+            "The port may be in use or the address does not belong to this computer.\n"
+        )
         return 1
     except KeyboardInterrupt:
-        stdout.write("Local UI stopped.\n")
+        stdout.write("UI stopped.\n")
     return 0
+
+
+ALL_INTERFACES = {"0.0.0.0", "::", ""}
+
+
+def is_loopback_host(host: str) -> bool:
+    """True when the server is reachable only from this computer."""
+    host = host.strip().strip("[]").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def startup_lines(host: str, port: int) -> List[str]:
+    """Addresses to print at start, so the user knows what to open."""
+    if is_loopback_host(host):
+        return [f"Local UI: http://{_url_host(host)}:{port}", "Available only on this computer."]
+
+    lines = ["Network UI: the interface is available to other computers in the network."]
+    if host.strip() in ALL_INTERFACES:
+        addresses = network_addresses()
+        if addresses:
+            lines.append("Open from another computer:")
+            lines.extend(f"  http://{address}:{port}" for address in addresses)
+        else:
+            lines.append(f"Open from another computer: http://<IP of this server>:{port}")
+    else:
+        lines.append(f"Open from another computer: http://{_url_host(host)}:{port}")
+    lines.append(f"On this computer: http://127.0.0.1:{port}")
+    lines.append("If it does not open from another computer, allow the port in the firewall.")
+    return lines
+
+
+def network_addresses() -> List[str]:
+    """IPv4 addresses of this computer that other computers can use."""
+    found: List[str] = []
+
+    def add(address: str) -> None:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return
+        if ip.version == 4 and not ip.is_loopback and not ip.is_link_local and address not in found:
+            found.append(address)
+
+    # Address of the interface used for outgoing traffic. UDP connect sends no packets.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("10.255.255.255", 1))
+            add(probe.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            add(info[4][0])
+    except OSError:
+        pass
+    return found
+
+
+def _url_host(host: str) -> str:
+    host = host.strip()
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
 
 
 def _default_detector_factory(args: argparse.Namespace) -> OllamaDetector:

@@ -90,6 +90,84 @@ class CliTests(CliTestCase):
         self.assertEqual(args.host, "127.0.0.1")
         self.assertEqual(args.port, 8765)
 
+    def test_ui_accepts_network_host(self):
+        args = app.build_parser().parse_args(["ui", "--host", "0.0.0.0", "--port", "9000"])
+
+        self.assertEqual(args.host, "0.0.0.0")
+        self.assertEqual(args.port, 9000)
+
+    def test_loopback_hosts_are_local(self):
+        for host in ("127.0.0.1", "localhost", "::1", "[::1]", "127.0.0.5"):
+            self.assertTrue(app.is_loopback_host(host), host)
+        for host in ("0.0.0.0", "::", "192.168.1.25", "server01"):
+            self.assertFalse(app.is_loopback_host(host), host)
+
+    def test_startup_lines_for_local_mode(self):
+        lines = app.startup_lines("127.0.0.1", 8765)
+
+        self.assertEqual(lines[0], "Local UI: http://127.0.0.1:8765")
+        self.assertNotIn("Network", "\n".join(lines))
+
+    def test_startup_lines_for_all_interfaces_list_server_addresses(self):
+        original = app.network_addresses
+        app.network_addresses = lambda: ["192.168.1.25", "10.0.0.7"]
+        try:
+            text = "\n".join(app.startup_lines("0.0.0.0", 8765))
+        finally:
+            app.network_addresses = original
+
+        self.assertIn("Network UI", text)
+        self.assertIn("http://192.168.1.25:8765", text)
+        self.assertIn("http://10.0.0.7:8765", text)
+        self.assertNotIn("http://0.0.0.0", text)
+        self.assertIn("firewall", text)
+
+    def test_startup_lines_for_specific_server_address(self):
+        text = "\n".join(app.startup_lines("192.168.1.25", 8765))
+
+        self.assertIn("http://192.168.1.25:8765", text)
+
+    def test_network_addresses_are_ipv4_and_not_loopback(self):
+        for address in app.network_addresses():
+            self.assertRegex(address, r"^\d+\.\d+\.\d+\.\d+$")
+            self.assertFalse(address.startswith("127."))
+
+    def test_ui_passes_network_mode_and_prints_addresses(self):
+        import web_ui
+
+        captured = {}
+        original_serve = web_ui.serve
+
+        def fake_serve(host, port, application):
+            captured["host"] = host
+            captured["network_mode"] = application.network_mode
+
+        web_ui.serve = fake_serve
+        try:
+            code, stdout, stderr = self.run_app(["ui", "--host", "0.0.0.0", "--port", "8765"])
+        finally:
+            web_ui.serve = original_serve
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(captured, {"host": "0.0.0.0", "network_mode": True})
+        self.assertIn("Network UI", stdout)
+
+    def test_ui_reports_port_that_cannot_be_opened(self):
+        import web_ui
+
+        def failing_serve(host, port, application):
+            raise OSError("address in use")
+
+        original_serve = web_ui.serve
+        web_ui.serve = failing_serve
+        try:
+            code, stdout, stderr = self.run_app(["ui", "--port", "8765"])
+        finally:
+            web_ui.serve = original_serve
+
+        self.assertEqual(code, 1)
+        self.assertIn("could not start", stderr)
+
     def test_detector_options_accept_timeout_seconds(self):
         args = app.build_parser().parse_args(
             ["scan", "--timeout-seconds", "360", "input.txt"]

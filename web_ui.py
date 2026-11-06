@@ -92,10 +92,13 @@ class GatewayWebApp:
         detector_factory: Optional[Callable[[], object]] = None,
         chunk_lines: Optional[int] = None,
         db_path: Path = DEFAULT_DB_PATH,
+        network_mode: bool = False,
     ) -> None:
         self.detector_factory = detector_factory or (lambda: OllamaDetector())
         self.chunk_lines = chunk_lines
         self.db_path = db_path
+        self.network_mode = network_mode
+        self.page_html = render_page(network_mode).encode("utf-8")
         init_db(self.db_path)
 
     def __call__(self, environ, start_response):
@@ -104,9 +107,9 @@ class GatewayWebApp:
 
         try:
             if method == "GET" and path == "/":
-                return _respond(start_response, "200 OK", PAGE_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                return _respond(start_response, "200 OK", self.page_html, "text/html; charset=utf-8")
             if method == "GET" and path == "/health":
-                return _json_response(start_response, "200 OK", {"status": "ok", "local": True})
+                return _json_response(start_response, "200 OK", {"status": "ok", "local": not self.network_mode})
             if method == "POST" and path == "/anonymize":
                 return self._anonymize(environ, start_response)
             if method == "POST" and path == "/restore":
@@ -294,6 +297,29 @@ class GatewayWebApp:
         )
 
 
+LOCAL_BADGE = "Только 127.0.0.1"
+LOCAL_NOTE = (
+    "<strong>Файлы и база остаются на этом компьютере.</strong> Интерфейс слушает только локальный адрес. "
+    "Во внешнюю AI-систему передавайте только SAFE-файл."
+)
+NETWORK_BADGE = "Сетевой режим"
+NETWORK_NOTE = (
+    "<strong>Файлы и база хранятся на сервере.</strong> Интерфейс доступен по сети; входа и разграничения "
+    "доступа пока нет — используйте только тестовые документы. Во внешнюю AI-систему передавайте только SAFE-файл."
+)
+
+
+def render_page(network_mode: bool = False) -> str:
+    """Page HTML with texts that match the real listening mode."""
+    badge, note = (NETWORK_BADGE, NETWORK_NOTE) if network_mode else (LOCAL_BADGE, LOCAL_NOTE)
+    badge_class = "local-badge network" if network_mode else "local-badge"
+    return (
+        PAGE_HTML.replace("__MODE_BADGE_CLASS__", badge_class)
+        .replace("__MODE_BADGE__", badge)
+        .replace("__MODE_NOTE__", note)
+    )
+
+
 def serve(host: str, port: int, application: GatewayWebApp) -> None:
     with make_server(
         host,
@@ -439,6 +465,8 @@ PAGE_HTML = """<!doctype html>
     .brand-mark { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px; color: white; background: linear-gradient(135deg, var(--blue), #5688e2); box-shadow: 0 8px 18px rgba(33,92,199,.25); }
     .local-badge { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border: 1px solid #bfe3d2; border-radius: 999px; background: var(--green-soft); color: #126441; font-size: 13px; font-weight: 700; }
     .local-badge::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: #23a66f; box-shadow: 0 0 0 4px rgba(35,166,111,.12); }
+    .local-badge.network { border-color: #f1d08a; background: #fff6e0; color: #8a5a00; }
+    .local-badge.network::before { background: #e0a100; box-shadow: 0 0 0 4px rgba(224,161,0,.15); }
     .hero { max-width: 780px; margin-bottom: 32px; }
     .eyebrow { color: var(--blue); font-size: 13px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase; }
     h1 { margin: 10px 0 14px; font-size: clamp(34px, 6vw, 58px); line-height: 1.02; letter-spacing: -.045em; }
@@ -482,7 +510,7 @@ PAGE_HTML = """<!doctype html>
   <main class="shell">
     <header class="topbar">
       <div class="brand"><span class="brand-mark">SG</span><span>Secure AI Document Gateway</span></div>
-      <span class="local-badge">Только 127.0.0.1</span>
+      <span class="__MODE_BADGE_CLASS__">__MODE_BADGE__</span>
     </header>
 
     <section class="hero">
@@ -524,7 +552,7 @@ PAGE_HTML = """<!doctype html>
 
     <aside class="privacy">
       <span class="lock" aria-hidden="true">🔒</span>
-      <div><strong>Файлы и база остаются на этом компьютере.</strong> Интерфейс слушает только локальный адрес. Во внешнюю AI-систему передавайте только SAFE-файл.</div>
+      <div>__MODE_NOTE__</div>
     </aside>
   </main>
   <script>

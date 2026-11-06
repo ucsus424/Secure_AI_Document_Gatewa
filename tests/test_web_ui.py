@@ -76,6 +76,49 @@ class WebUiTests(unittest.TestCase):
         self.assertNotIn("mapping.json", html)
         self.assertIn("127.0.0.1", html)
 
+    def test_local_mode_page_and_health(self):
+        status, headers, body = _request(self.app, "GET", "/")
+        html = body.decode("utf-8")
+        self.assertIn("Только 127.0.0.1", html)
+        self.assertNotIn("Сетевой режим", html)
+        self.assertNotIn("__MODE_", html)
+
+        status, headers, body = _request(self.app, "GET", "/health")
+        self.assertEqual(json.loads(body.decode("utf-8")), {"status": "ok", "local": True})
+
+    def test_network_mode_page_and_health(self):
+        app = GatewayWebApp(detector_factory=lambda: FakeDetector(), db_path=self.db_path, network_mode=True)
+
+        status, headers, body = _request(app, "GET", "/")
+        html = body.decode("utf-8")
+        self.assertEqual(status, "200 OK")
+        self.assertIn("Сетевой режим", html)
+        self.assertIn("хранятся на сервере", html)
+        self.assertNotIn("Только 127.0.0.1", html)
+        self.assertNotIn("слушает только локальный адрес", html)
+        self.assertNotIn("__MODE_", html)
+
+        status, headers, body = _request(app, "GET", "/health")
+        self.assertEqual(json.loads(body.decode("utf-8")), {"status": "ok", "local": False})
+
+    def test_network_mode_anonymize_and_restore_still_work(self):
+        app = GatewayWebApp(detector_factory=lambda: FakeDetector(), db_path=self.db_path, network_mode=True)
+        original = "Инженер Петров А.В. на объекте."
+
+        status, headers, safe_body = _request(
+            app, "POST", "/anonymize",
+            files={"document": ("input.txt", original.encode("utf-8"), "text/plain")},
+        )
+        self.assertEqual(status, "200 OK")
+        document_id = headers["X-Document-Id"]
+
+        status, headers, body = _request(
+            app, "POST", "/restore",
+            files={"document": (f"input_SAFE_{document_id}.txt", safe_body, "text/plain")},
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body.decode("utf-8"), original)
+
     def test_anonymize_returns_only_safe_file_and_saves_values_to_database(self):
         status, headers, body = _request(
             self.app,
